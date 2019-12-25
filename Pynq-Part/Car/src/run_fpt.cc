@@ -3,8 +3,8 @@
  * @GitHub: wutianze
  * @Email: 1369130123qq@gmail.com
  * @Date: 2019-09-19 12:44:06
- * @LastEditors: Sauron Wu
- * @LastEditTime: 2019-11-25 17:58:56
+ * @LastEditors  : Sauron Wu
+ * @LastEditTime : 2019-12-24 16:40:57
  * @Description: 
  */
 #include <assert.h>
@@ -41,8 +41,8 @@ using namespace std::chrono;
 #define CVCONTROL 1
 
 //camera parameters: img size
-#define TAKE_SIZE_WIDTH 416
-#define TAKE_SIZE_HEIGHT 416 
+#define TAKE_SIZE_WIDTH 640
+#define TAKE_SIZE_HEIGHT 480 
 
 
 // commander indicates the car is controlled by AI or opencv currently
@@ -194,27 +194,70 @@ tmpC.steer = 0;
 addCommand(tmpC);
 }
 
+// if not green, then is red or yellow which means stop
+#define iLowH_green 40
+#define iHighH_green 90
+#define iLowS 90
+#define iHighS 255
+#define iLowV 90
+#define iHighV 255
+//0 is green
+int get_light(Mat img){
+    Mat imgHSV;
+    vector<Mat> hsvSplit;
+    cvtColor(img,imgHSV,COLOR_BGR2HSV);
+  
+    //转化成直方图均衡化
+    split(imgHSV,hsvSplit);
+    equalizeHist(hsvSplit[2],hsvSplit[2]);
+    merge(hsvSplit,imgHSV);
+    Mat imgThresholded;
+    //确定颜色显示的范围
+    inRange(imgHSV, Scalar(iLowH_green, iLowS, iLowV), Scalar(iHighH_green, iHighS,iHighV),imgThresholded);
+    //去除噪点
+    Mat element = getStructuringElement(MORPH_RECT,Size(5,5));
+    morphologyEx(imgThresholded,imgThresholded,MORPH_OPEN,element);
+     //连接连通域
+    morphologyEx(imgThresholded, imgThresholded, MORPH_CLOSE, element);
+    int count_green = 0;
+for(int nrow=0;nrow<imgThresholded.rows;nrow++)
+    {
+        uchar*data=imgThresholded.ptr<uchar>(nrow);
+        for(int ncol=0;ncol<imgThresholded.cols*imgThresholded.channels();ncol++)
+        {
+            count_green++;
+        }
+    }
+    if(count_green >(imgThresholded.rows*imgThresholded.cols*imgThresholded.channels())/5)return 0;
+    return 1;
+}
+
 //----------fpt rules
-#define IGNORE_OB_X  350
-#define IGNORE_OB_AREA 100
+// last_command: -1:no command, 0:avoid, 1:stop, 2:back to cv
+int last_command = -1;
+int pre_last_command = -1;
+
+#define IGNORE_OB_X  0.3
+#define IGNORE_OB_AREA 0.2
 #define SEE_OBSTACLE 2
-int detect_valid_ob = 0;
 
-#define PERSON_OUT_X 100
-#define IGNORE_PER_AREA 100
+#define PERSON_OUT_X 0.1
+#define IGNORE_PER_AREA 0.1
 #define SEE_PER 2
-int detect_valid_per = 0;
 
-#define IGNORE_SIDEWALK_AREA 300
+#define IGNORE_SIDEWALK_AREA 0.3
 #define SEE_SIDEWALK 2
-int detect_valid_side = 0;
+
+#define IGNORE_LIGHT_AREA 0.3
 //-------------------
 
-void box_handler(vector<vector<float>>&res){
+void box_handler(vector<vector<float>>&res, Mat&img){
     //person_place means where is the person, -1:no person;0:in the road;1:out of the road
     int person_place = -1;
     bool has_ob = false;
     bool has_side = false;
+    //0 is green, 1 is yellow or red
+    int light = -1;
 
     //first find things
     for(int i=0;i<res.size();i++){
@@ -222,11 +265,6 @@ void box_handler(vector<vector<float>>&res){
             //person
             case 0:{
                 if(res[i][2]*res[i][3] < IGNORE_PER_AREA){
-                    detect_valid_ob = 0;
-                    detect_valid_per = 0;
-                }
-                if(detect_valid_per < SEE_PER){
-                    detect_valid_per++;
                     continue;
                 }
                 if(res[i][0]-res[i][2]/2 < PERSON_OUT_X){
@@ -235,63 +273,120 @@ void box_handler(vector<vector<float>>&res){
                 else{
                     person_place = 0;
                 }
-                detect_valid_per = 0;
                 break;
             }
             //obstacles
             case 1:case 2:case 3:{
                 if(res[i][0]-res[i][2]/2 > IGNORE_OB_X || res[i][2] * res[i][3] < IGNORE_OB_AREA){
-                    detect_valid_ob = 0;
                     continue;
                 }
-                detect_valid_ob++;
-                if(detect_valid_ob > SEE_OBSTACLE){
-                    has_ob = true;
-                    detect_valid_ob = 0;
-                }
+                has_ob = true;
                 break;
             }
             //sidewalk
             case 4:{
                 if(res[i][2]*res[i][3] < IGNORE_PER_AREA){
-                    detect_valid_side = 0;
                     continue;
                 }
-                detect_valid_side++;
-                if(detect_valid_side > SEE_SIDEWALK){
-                    has_side = true;
-                    detect_valid_side = 0;
+                has_side = true;
+                break;
+            }
+            //lights
+            case 5:{
+                if(res[i][2]*res[i][3] < IGNORE_PER_AREA){
+                    continue;
                 }
+                light = get_light(img(Rect((res[i][0]-res[i][2]/2)*TAKE_SIZE_WIDTH,(res[i][1]-res[i][3]/2)*TAKE_SIZE_HEIGHT,res[i][2]*TAKE_SIZE_WIDTH,res[i][3]*TAKE_SIZE_HEIGHT)));
                 break;
             }
         }
     }
 
-    //find both ob and person, ignore person
-    if(has_ob && person_place != -1){
-        person_place = -1;
-    }
-
-    //second control according to findings
+    int now_command = -1;
+    //second generate last_command
     if(has_ob){
-        commanderLock.lock();
-        commander = NNCONTROL;
-        commanderLock.unlock();
-        avoid();
-        commanderLock.lock();
-        commander = CVCONTROL;
-        commanderLock.unlock();
-        has_ob = false;
-        return;
-    }
-    if(person_place == 0){
-        steer_throttle_command tmpC;
-        tmpC.steer = 0;
-        tmpC.throttle = 0;
-        addCommand(tmpC);
+        now_command = 0;
+    }else if(person_place == 0){
+        now_command = 1;
     }else if(person_place == 1){
-        if(has_side){}
+        if(has_side){
+            switch(light){
+                case -1:case 1:{//if the light is not green or no light,stop
+                    now_command = 1;
+                    break;
+                }
+                case 0:{//if the light is green and the people is not in the road, keep running
+                    now_command = 2;
+                    break;
+                }
+            }
+        }else{//no side, people not in road, run(shouldn't have light)
+            switch(light){
+                case 1:{//if the light is not green stop
+                    now_command = 1;
+                    break;
+                }
+                case 0:case -1:{//if the light is green and the people is not in the road, keep running
+                    now_command = 2;
+                    break;
+                }
+            }
+        }
+    }else if(person_place == -1){
+        switch(light){
+                //no ob no person no light just use cv
+                case -1:case 0:{
+                    now_command = 2;
+                    break;
+                }
+                case 1:{
+                    now_command = 1;
+                    break;
+                }
+            }
     }
+    bool change = false;
+    if(last_command == now_command && last_command != pre_last_command){
+        change = true;
+    }
+    if(change){
+        switch(now_command){
+            case 0:{
+                commanderLock.lock();
+                commander = NNCONTROL;
+                commanderLock.unlock();
+                avoid();
+                commanderLock.lock();
+                commander = CVCONTROL;
+                commanderLock.unlock();
+                break;
+            }
+            case 1:{
+                commanderLock.lock();
+                commander = NNCONTROL;
+                commanderLock.unlock();
+                steer_throttle_command tmpC;
+                tmpC.steer = 0;
+                tmpC.throttle = 0;
+                addCommand(tmpC);
+                break;
+            }
+            case 2:{
+                commanderLock.lock();
+                commander = CVCONTROL;
+                commanderLock.unlock();
+                break;
+            }
+            default:{
+                commanderLock.lock();
+                commander = CVCONTROL;
+                commanderLock.unlock();
+                break;
+            }
+        }
+    }
+    pre_last_command = last_command;
+    last_command = now_command;
 
 }
 
@@ -315,15 +410,16 @@ void run_model(DPUTask* task){
 	    vector<vector<float>> res = deal(task, tmpImage, sw, sh);
         //imshow("yolo-v3", img);
         //waitKey(0);	    //takenImages.wait_and_pop(tmpImage);
-        box_handler(res);
+        box_handler(res,tmpImage);
     }
     exitLock.unlock();
     cout<<"Run Model Exit\n";
 }
 
-#define STRAIGHT_LEFT_K -7.5
-#define STRAIGHT_RIGHT_K 7.5
-#define K_RANGE 0.1
+#define STRAIGHT_LEFT_K -1.1
+#define STRAIGHT_RIGHT_K 1.1
+#define L_TOO_LEFT 85
+#define K_RANGE 0.2
 void run_cv(){
     cout<<"Run CV\n";
     Mat tmpImage;
@@ -351,23 +447,25 @@ void run_cv(){
         
         steer_throttle_command tmpC;
         if(canFind == 1){//cannot find left but can find right
-            float tmpK = laneR.k.get();
+            tmpC.steer = -0.4;
+		/*float tmpK = laneR.k.get();
 	    float tmpB = laneR.b.get();
 	    if(tmpK > STRAIGHT_RIGHT_K + K_RANGE|| tmpK < 0)tmpC.steer = 0.5;
 	    else if(tmpK < STRAIGHT_RIGHT_K - K_RANGE && tmpK > 0)tmpC.steer = float(STRAIGHT_RIGHT_K - K_RANGE - tmpK)/float(STRAIGHT_RIGHT_K - K_RANGE);
-    	    if((72- tmpB)/tmpK < 140)tmpC.steer = -0.4;
+    	    //if((72- tmpB)/tmpK < 140)tmpC.steer = -0.4;
 	    cout<<"laneR k:"<<tmpK<<endl;
 	    //cout<<"laneR b:"<<laneR.b.get()<<",k:"<<laneR.k.get()<<";steer:"<<tmpC.steer<<"\r\033[k";
+	    */
         }else if(canFind == 3){
-	    tmpC.steer = 0;
+	    tmpC.steer = -0.4;
     	    //cout<<"cannot find any so steer:"<<tmpC.steer<<"\r\033[k";
 	}else{
             float tmpB = laneL.b.get();
     	    float tmpK = laneL.k.get();
-            if(tmpK > STRAIGHT_LEFT_K + K_RANGE && tmpK < 0)tmpC.steer = float(STRAIGHT_LEFT_K + K_RANGE - tmpK)/float(STRAIGHT_LEFT_K + K_RANGE);
+	    if(tmpK > STRAIGHT_LEFT_K + K_RANGE && tmpK < 0)tmpC.steer = float(STRAIGHT_LEFT_K + K_RANGE - tmpK)/float(STRAIGHT_LEFT_K + K_RANGE);
             else if(tmpK < STRAIGHT_LEFT_K - K_RANGE || tmpK > 0)tmpC.steer = -0.5;
-	    if((72- tmpB)/tmpK > 70)tmpC.steer = 0.4;
-	    cout<<"laneL k:"<<tmpK<<endl;
+	    if(tmpB > L_TOO_LEFT)tmpC.steer += 0.3;
+	    cout<<"laneL k:"<<tmpK<<" b:"<<tmpB<<endl;
     	    //if(tmpK > 10 && -tmpB/tmpK > TOO_LEFT)tmpC.steer = 
     	    //cout<<"laneL b:"<<laneL.b.get()<<",k:"<<laneL.k.get()<<"; laneR b:"<<laneR.b.get()<<",k:"<<laneR.k.get()<<";steer:"<<tmpC.steer<<"\r\033[k";
         }
@@ -449,7 +547,7 @@ int main(int argc, char **argv)
       }
 
     signal(SIGTSTP,sig_handler);
-/*
+    /*
     dpuOpen();
     DPUKernel *kernelConv = dpuLoadKernel(YOLOKERNEL);
     vector<DPUTask*> tasks(TASKNUM);
@@ -457,15 +555,15 @@ int main(int argc, char **argv)
     */
     vector<thread> threads;
     threads.push_back(thread(run_command));
-    //threads.push_back(thread(run_camera));
-    //threads.push_back(thread(run_cv));
+    threads.push_back(thread(run_camera));
+    threads.push_back(thread(run_cv));
  
     /*
     for(int i=0;i<TASKNUM;i++){
     	threads.push_back(thread(run_model,tasks[i]));
     }
 */
-    threads.push_back(thread(big_right));
+    //threads.push_back(thread(big_right));
     
     for(int i = 0; i < threads.size(); i++){
         threads[i].join();
